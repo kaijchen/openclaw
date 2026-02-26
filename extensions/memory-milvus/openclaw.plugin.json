@@ -73,6 +73,9 @@
           },
           "baseUrl": {
             "type": "string"
+          },
+          "dims": {
+            "type": "number"
           }
         },
         "required": ["apiKey"]
