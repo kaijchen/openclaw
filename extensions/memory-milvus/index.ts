@@ -252,11 +252,15 @@ class MilvusMemoryDB {
 
   async count(): Promise<number> {
     await this.ensureInitialized();
-    const stats = await this.client!.getCollectionStatistics({
+    const result = await this.client!.query({
       collection_name: this.collectionName,
+      output_fields: ["count(*)"],
     });
-    const rowCount = stats.data?.row_count;
-    return typeof rowCount === "number" ? rowCount : parseInt(String(rowCount ?? "0"), 10);
+    const row = result.data?.[0];
+    if (row && typeof row["count(*)"] !== "undefined") {
+      return Number(row["count(*)"]);
+    }
+    return 0;
   }
 }
 
