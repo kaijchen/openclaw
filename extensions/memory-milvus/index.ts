@@ -238,16 +238,42 @@ class MilvusMemoryDB {
 
   async delete(id: string): Promise<boolean> {
     await this.ensureInitialized();
-    // Validate UUID format to prevent injection
+    // Strip brackets the agent might include, e.g. "[5371bf30]" → "5371bf30"
+    const cleaned = id.replace(/[\[\]]/g, "").trim();
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(id)) {
-      throw new Error(`Invalid memory ID format: ${id}`);
+
+    if (uuidRegex.test(cleaned)) {
+      // Full UUID — delete directly
+      await this.client!.delete({
+        collection_name: this.collectionName,
+        filter: `id == "${cleaned}"`,
+      });
+      return true;
     }
-    await this.client!.delete({
-      collection_name: this.collectionName,
-      filter: `id == "${id}"`,
-    });
-    return true;
+
+    // Prefix match — find by ID prefix (agent may pass truncated ID)
+    const hexRegex = /^[0-9a-f]{4,}$/i;
+    if (hexRegex.test(cleaned)) {
+      const results = await this.client!.query({
+        collection_name: this.collectionName,
+        filter: `id like "${cleaned}%"`,
+        output_fields: ["id"],
+        limit: 2,
+      });
+      if (results.data.length === 1) {
+        await this.client!.delete({
+          collection_name: this.collectionName,
+          filter: `id == "${results.data[0].id}"`,
+        });
+        return true;
+      }
+      if (results.data.length > 1) {
+        throw new Error(`Ambiguous ID prefix "${cleaned}" — matches ${results.data.length} memories. Use the full ID.`);
+      }
+      throw new Error(`No memory found matching ID prefix "${cleaned}"`);
+    }
+
+    throw new Error(`Invalid memory ID format: ${id}`);
   }
 
   async count(): Promise<number> {
@@ -564,7 +590,7 @@ const memoryPlugin = {
             }
 
             const list = results
-              .map((r) => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}...`)
+              .map((r) => `- ${r.entry.id}: ${r.entry.text.slice(0, 80)}`)
               .join("\n");
 
             // Strip vector data for serialization
