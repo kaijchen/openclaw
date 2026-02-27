@@ -738,8 +738,7 @@ const memoryPlugin = {
             // --- Milvus Connection ---
             const address = await clack.text({
               message: "Milvus address",
-              initialValue: "localhost:19530",
-              placeholder: "host:port or http://host:port",
+              placeholder: "host:port or https://host:port",
               validate: (v) => (!v?.trim() ? "Address is required" : undefined),
             });
             if (clack.isCancel(address)) { clack.cancel("Setup cancelled."); return; }
@@ -761,7 +760,7 @@ const memoryPlugin = {
             if (authType === "password") {
               const usernameInput = await clack.text({
                 message: "Milvus username",
-                initialValue: "root",
+                initialValue: "admin",
               });
               if (clack.isCancel(usernameInput)) { clack.cancel("Setup cancelled."); return; }
               username = usernameInput;
