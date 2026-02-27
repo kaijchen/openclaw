@@ -805,6 +805,31 @@ const memoryPlugin = {
           });
 
         memory
+          .command("config")
+          .description("Show current plugin configuration")
+          .action(() => {
+            const display = {
+              embedding: {
+                model: cfg.embedding.model ?? "(default: text-embedding-3-small)",
+                baseUrl: cfg.embedding.baseUrl ?? "(default: OpenAI)",
+                apiKey: cfg.embedding.apiKey ? `${cfg.embedding.apiKey.slice(0, 4)}...${cfg.embedding.apiKey.slice(-4)}` : "(not set)",
+                dims: cfg.embedding.dims ?? `(resolved: ${vectorDim})`,
+              },
+              milvus: {
+                address: cfg.milvus.address,
+                collectionName: cfg.milvus.collectionName ?? "openclaw_memories",
+                auth: cfg.milvus.token ? "token" : cfg.milvus.username ? "password" : "none",
+              },
+              behavior: {
+                autoRecall: cfg.autoRecall ?? true,
+                autoCapture: cfg.autoCapture ?? false,
+              },
+            };
+            console.log(JSON.stringify(display, null, 2));
+            console.log(`\nTo change a value:\n  openclaw config set extensions.memory-milvus.<path> <value>`);
+          });
+
+        memory
           .command("migrate")
           .description("Migrate memories after embedding model change")
           .action(async () => {
