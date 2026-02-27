@@ -5,6 +5,7 @@
   "description": "OpenClaw Milvus-backed long-term memory plugin with auto-recall/capture",
   "type": "module",
   "dependencies": {
+    "@clack/prompts": "^1.0.1",
     "@sinclair/typebox": "0.34.48",
     "@zilliz/milvus2-sdk-node": "^2.6.0",
     "openai": "^6.25.0"
