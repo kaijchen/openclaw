@@ -668,96 +668,156 @@ const memoryPlugin = {
           .command("setup")
           .description("Interactive setup wizard for memory-milvus plugin")
           .action(async () => {
-            const readline = await import("node:readline");
+            const clack = await import("@clack/prompts");
             const fs = await import("node:fs");
             const path = await import("node:path");
             const os = await import("node:os");
 
-            const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-            const ask = (prompt: string, defaultValue?: string): Promise<string> =>
-              new Promise((resolve) => {
-                const suffix = defaultValue ? ` [${defaultValue}]` : "";
-                rl.question(`${prompt}${suffix}: `, (answer: string) => {
-                  resolve(answer.trim() || defaultValue || "");
-                });
-              });
-            const askSecret = (prompt: string): Promise<string> =>
-              new Promise((resolve) => {
-                process.stdout.write(`${prompt}: `);
-                const stdin = process.stdin;
-                const wasRaw = stdin.isRaw;
-                if (stdin.isTTY) stdin.setRawMode(true);
-                let secret = "";
-                const onData = (ch: Buffer) => {
-                  const c = ch.toString("utf8");
-                  if (c === "\n" || c === "\r") {
-                    stdin.removeListener("data", onData);
-                    if (stdin.isTTY) stdin.setRawMode(wasRaw ?? false);
-                    process.stdout.write("\n");
-                    resolve(secret);
-                  } else if (c === "\x7f" || c === "\b") {
-                    secret = secret.slice(0, -1);
-                  } else if (c === "\x03") {
-                    // Ctrl+C
-                    rl.close();
-                    process.exit(1);
-                  } else {
-                    secret += c;
-                  }
-                };
-                stdin.on("data", onData);
-              });
-            const askYesNo = async (prompt: string, defaultValue = false): Promise<boolean> => {
-              const suffix = defaultValue ? "[Y/n]" : "[y/N]";
-              const answer = await ask(`${prompt} ${suffix}`);
-              if (!answer) return defaultValue;
-              return answer.toLowerCase().startsWith("y");
-            };
+            clack.intro("🔧 memory-milvus setup");
 
-            console.log("\n🔧 memory-milvus setup wizard\n");
+            // --- Embedding Provider ---
+            const embeddingProvider = await clack.select({
+              message: "Embedding provider",
+              options: [
+                { value: "openai", label: "OpenAI", hint: "text-embedding-3-small / 3-large" },
+                { value: "custom", label: "Custom (OpenAI-compatible)", hint: "Doubao, Azure, etc." },
+              ],
+            });
+            if (clack.isCancel(embeddingProvider)) { clack.cancel("Setup cancelled."); return; }
 
-            // --- Embedding config ---
-            console.log("── Embedding Provider ──");
-            const apiKey = await askSecret("API key (or env var like ${EMBEDDING_API_KEY})");
+            const apiKey = await clack.password({
+              message: "Embedding API key",
+              validate: (v) => (!v?.trim() ? "API key is required" : undefined),
+            });
+            if (clack.isCancel(apiKey)) { clack.cancel("Setup cancelled."); return; }
 
-            const baseUrl = await ask("Base URL (blank for OpenAI)", "");
-            const model = await ask("Model name", baseUrl ? "" : "text-embedding-3-small");
+            let baseUrl = "";
+            let model = "";
             let dims: number | undefined;
-            if (baseUrl || (model && !["text-embedding-3-small", "text-embedding-3-large"].includes(model))) {
-              const dimsStr = await ask("Vector dimensions");
-              dims = dimsStr ? parseInt(dimsStr, 10) : undefined;
-              if (!dims || dims <= 0) {
-                console.log("  ⚠ dims is required for non-OpenAI models");
-                rl.close();
-                return;
-              }
+
+            if (embeddingProvider === "custom") {
+              const baseUrlInput = await clack.text({
+                message: "Embedding base URL",
+                placeholder: "https://ark.cn-beijing.volces.com/api/v3",
+                validate: (v) => (!v?.trim() ? "Base URL is required for custom provider" : undefined),
+              });
+              if (clack.isCancel(baseUrlInput)) { clack.cancel("Setup cancelled."); return; }
+              baseUrl = baseUrlInput;
+
+              const modelInput = await clack.text({
+                message: "Model name",
+                placeholder: "ep-m-20250630180859-zzj6m",
+                validate: (v) => (!v?.trim() ? "Model name is required" : undefined),
+              });
+              if (clack.isCancel(modelInput)) { clack.cancel("Setup cancelled."); return; }
+              model = modelInput;
+
+              const dimsInput = await clack.text({
+                message: "Vector dimensions",
+                placeholder: "2048",
+                validate: (v) => {
+                  const n = parseInt(v, 10);
+                  if (!n || n <= 0) return "Must be a positive number";
+                  return undefined;
+                },
+              });
+              if (clack.isCancel(dimsInput)) { clack.cancel("Setup cancelled."); return; }
+              dims = parseInt(dimsInput, 10);
+            } else {
+              const modelChoice = await clack.select({
+                message: "Embedding model",
+                options: [
+                  { value: "text-embedding-3-small", label: "text-embedding-3-small", hint: "1536 dims, fast, cheap" },
+                  { value: "text-embedding-3-large", label: "text-embedding-3-large", hint: "3072 dims, more accurate" },
+                ],
+              });
+              if (clack.isCancel(modelChoice)) { clack.cancel("Setup cancelled."); return; }
+              model = modelChoice;
             }
 
-            // --- Milvus config ---
-            console.log("\n── Milvus Connection ──");
-            const address = await ask("Milvus address", "localhost:19530");
-            const authType = await ask("Auth type (none/password/token)", "none");
+            // --- Milvus Connection ---
+            const address = await clack.text({
+              message: "Milvus address",
+              initialValue: "localhost:19530",
+              placeholder: "host:port or http://host:port",
+              validate: (v) => (!v?.trim() ? "Address is required" : undefined),
+            });
+            if (clack.isCancel(address)) { clack.cancel("Setup cancelled."); return; }
+
+            const authType = await clack.select({
+              message: "Milvus authentication",
+              options: [
+                { value: "none", label: "No authentication", hint: "local/dev instance" },
+                { value: "password", label: "Username & password" },
+                { value: "token", label: "Token / API key" },
+              ],
+            });
+            if (clack.isCancel(authType)) { clack.cancel("Setup cancelled."); return; }
 
             let username: string | undefined;
             let password: string | undefined;
             let token: string | undefined;
 
             if (authType === "password") {
-              username = await ask("Username", "root");
-              password = await askSecret("Password (or env var like ${MILVUS_PASSWORD})");
+              const usernameInput = await clack.text({
+                message: "Milvus username",
+                initialValue: "root",
+              });
+              if (clack.isCancel(usernameInput)) { clack.cancel("Setup cancelled."); return; }
+              username = usernameInput;
+
+              const passwordInput = await clack.password({
+                message: "Milvus password",
+                validate: (v) => (!v?.trim() ? "Password is required" : undefined),
+              });
+              if (clack.isCancel(passwordInput)) { clack.cancel("Setup cancelled."); return; }
+              password = passwordInput;
             } else if (authType === "token") {
-              token = await askSecret("Token (or env var like ${MILVUS_TOKEN})");
+              const tokenInput = await clack.password({
+                message: "Milvus token",
+                validate: (v) => (!v?.trim() ? "Token is required" : undefined),
+              });
+              if (clack.isCancel(tokenInput)) { clack.cancel("Setup cancelled."); return; }
+              token = tokenInput;
             }
 
-            const collectionName = await ask("Collection name", "openclaw_memories");
-            const database = await ask("Database (blank for default)", "");
-
             // --- Behavior ---
-            console.log("\n── Behavior ──");
-            const autoRecall = await askYesNo("Enable auto-recall?", true);
-            const autoCapture = await askYesNo("Enable auto-capture?", true);
+            const autoRecall = await clack.confirm({
+              message: "Enable auto-recall? (inject relevant memories into context)",
+              initialValue: true,
+            });
+            if (clack.isCancel(autoRecall)) { clack.cancel("Setup cancelled."); return; }
 
-            rl.close();
+            const autoCapture = await clack.confirm({
+              message: "Enable auto-capture? (save important info from conversations)",
+              initialValue: true,
+            });
+            if (clack.isCancel(autoCapture)) { clack.cancel("Setup cancelled."); return; }
+
+            // --- Test connection ---
+            const spin = clack.spinner();
+            spin.start("Testing Milvus connection...");
+            try {
+              const { MilvusClient } = await loadMilvus();
+              const testClient = new MilvusClient({
+                address,
+                ...(token ? { token } : {}),
+                ...(username ? { username } : {}),
+                ...(password ? { password } : {}),
+              });
+              await testClient.checkHealth();
+              spin.stop("✅ Milvus connection successful");
+            } catch (err) {
+              spin.stop(`⚠ Milvus connection failed: ${String(err)}`);
+              const proceed = await clack.confirm({
+                message: "Save config anyway?",
+                initialValue: false,
+              });
+              if (clack.isCancel(proceed) || !proceed) {
+                clack.cancel("Setup cancelled.");
+                return;
+              }
+            }
 
             // --- Build config ---
             const embeddingConfig: Record<string, unknown> = { apiKey };
@@ -769,8 +829,6 @@ const memoryPlugin = {
             if (username) milvusConfig.username = username;
             if (password) milvusConfig.password = password;
             if (token) milvusConfig.token = token;
-            if (collectionName !== "openclaw_memories") milvusConfig.collectionName = collectionName;
-            if (database) milvusConfig.database = database;
 
             const pluginCfg = {
               embedding: embeddingConfig,
@@ -811,9 +869,7 @@ const memoryPlugin = {
             }
             fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2) + "\n");
 
-            console.log(`\n✅ Config written to ${configPath}`);
-            console.log("\nRestart the gateway to apply changes:");
-            console.log("  openclaw gateway restart\n");
+            clack.outro(`Config saved to ${configPath}\n  Restart the gateway: openclaw gateway restart`);
           });
       },
       { commands: ["milvus-mem"] },
