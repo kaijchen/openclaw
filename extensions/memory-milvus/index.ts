@@ -819,6 +819,11 @@ const memoryPlugin = {
                 address: cfg.milvus.address,
                 collectionName: cfg.milvus.collectionName ?? "openclaw_memories",
                 auth: cfg.milvus.token ? "token" : cfg.milvus.username ? "password" : "none",
+                ...(cfg.milvus.token && { token: `${cfg.milvus.token.slice(0, 4)}...${cfg.milvus.token.slice(-4)}` }),
+                ...(cfg.milvus.username && {
+                  username: cfg.milvus.username,
+                  password: cfg.milvus.password ? `${cfg.milvus.password.slice(0, 2)}...${cfg.milvus.password.slice(-2)}` : "(not set)",
+                }),
               },
               behavior: {
                 autoRecall: cfg.autoRecall ?? true,
