@@ -51,6 +51,12 @@ type MemorySearchResult = {
   score: number;
 };
 
+type CollectionModelMeta = {
+  model: string;
+  baseUrl?: string;
+  dims: number;
+};
+
 // ============================================================================
 // Milvus Provider
 // ============================================================================
@@ -59,12 +65,18 @@ class MilvusMemoryDB {
   private client: MilvusClient | null = null;
   private initPromise: Promise<void> | null = null;
   private readonly collectionName: string;
+  modelMismatch: { stored: CollectionModelMeta; current: CollectionModelMeta } | null = null;
 
   constructor(
     private readonly config: MilvusMemoryConfig["milvus"],
     private readonly vectorDim: number,
+    private readonly modelMeta: CollectionModelMeta,
   ) {
     this.collectionName = config.collectionName || "openclaw_memories";
+  }
+
+  static buildModelMeta(model: string, dims: number, baseUrl?: string): CollectionModelMeta {
+    return { model, dims, ...(baseUrl ? { baseUrl } : {}) };
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -113,9 +125,10 @@ class MilvusMemoryDB {
     });
 
     if (!hasCollection.value) {
-      // Create collection with schema
+      // Create collection with schema + model metadata in description
       await this.client.createCollection({
         collection_name: this.collectionName,
+        description: JSON.stringify(this.modelMeta),
         consistency_level: "Strong",
         fields: [
           {
@@ -164,6 +177,16 @@ class MilvusMemoryDB {
         collection_name: this.collectionName,
       });
     } else {
+      // Check for model change
+      const stored = await this.getStoredModelMeta();
+      if (stored && (stored.model !== this.modelMeta.model || stored.baseUrl !== this.modelMeta.baseUrl)) {
+        this.modelMismatch = { stored, current: this.modelMeta };
+        throw new Error(
+          `Embedding model changed: "${stored.model}" → "${this.modelMeta.model}". ` +
+          `Run "openclaw milvus-mem migrate" to re-embed or reset the collection.`,
+        );
+      }
+
       // Ensure collection is loaded
       const loadState = await this.client.getLoadState({
         collection_name: this.collectionName,
@@ -287,6 +310,103 @@ class MilvusMemoryDB {
       return Number(row["count(*)"]);
     }
     return 0;
+  }
+
+  /** Read model metadata stored in collection description. */
+  async getStoredModelMeta(): Promise<CollectionModelMeta | null> {
+    if (!this.client) return null;
+    try {
+      const info = await this.client.describeCollection({ collection_name: this.collectionName });
+      const desc = (info as unknown as { schema?: { description?: string } }).schema?.description;
+      if (!desc) return null;
+      return JSON.parse(desc) as CollectionModelMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Retrieve all memory texts (for re-embedding). */
+  async getAllTexts(): Promise<Array<{ id: string; text: string; importance: number; category: string; created_at: number }>> {
+    if (!this.client) throw new Error("Not connected");
+    const rows: Array<{ id: string; text: string; importance: number; category: string; created_at: number }> = [];
+    let offset = 0;
+    const batchSize = 100;
+    while (true) {
+      const result = await this.client.query({
+        collection_name: this.collectionName,
+        output_fields: ["id", "text", "importance", "category", "created_at"],
+        limit: batchSize,
+        offset,
+      });
+      if (!result.data || result.data.length === 0) break;
+      for (const row of result.data) {
+        rows.push({
+          id: row.id as string,
+          text: row.text as string,
+          importance: row.importance as number,
+          category: row.category as string,
+          created_at: row.created_at as number,
+        });
+      }
+      if (result.data.length < batchSize) break;
+      offset += batchSize;
+    }
+    return rows;
+  }
+
+  /** Drop the collection and recreate with current model metadata. */
+  async dropAndRecreate(): Promise<void> {
+    if (!this.client) throw new Error("Not connected");
+    await this.client.dropCollection({ collection_name: this.collectionName });
+    this.initPromise = null;
+    this.modelMismatch = null;
+    await this.doInitialize();
+  }
+
+  /** Rename current collection to a backup name. */
+  async renameToBackup(): Promise<string> {
+    if (!this.client) throw new Error("Not connected");
+    const backupName = `${this.collectionName}_backup`;
+    // Drop existing backup if any
+    const hasBackup = await this.client.hasCollection({ collection_name: backupName });
+    if (hasBackup.value) {
+      await this.client.dropCollection({ collection_name: backupName });
+    }
+    await this.client.renameCollection({
+      collection_name: this.collectionName,
+      new_collection_name: backupName,
+    });
+    return backupName;
+  }
+
+  /** Drop the backup collection. */
+  async dropBackup(): Promise<void> {
+    if (!this.client) throw new Error("Not connected");
+    const backupName = `${this.collectionName}_backup`;
+    await this.client.dropCollection({ collection_name: backupName });
+  }
+
+  /** Connect to Milvus without the model check (for migration CLI). */
+  async connectForMigration(): Promise<void> {
+    if (this.client) return;
+    const { MilvusClient, DataType: _dt } = await loadMilvus();
+    const connectConfig: Record<string, unknown> = { address: this.config.address };
+    if (this.config.token) connectConfig.token = this.config.token;
+    if (this.config.username) {
+      connectConfig.username = this.config.username;
+      connectConfig.password = this.config.password;
+    }
+    if (this.config.database) connectConfig.database = this.config.database;
+    this.client = new MilvusClient(connectConfig as { address: string; [key: string]: unknown });
+
+    // Load collection if it exists
+    const hasCollection = await this.client.hasCollection({ collection_name: this.collectionName });
+    if (hasCollection.value) {
+      const loadState = await this.client.getLoadState({ collection_name: this.collectionName });
+      if (loadState.state !== "LoadStateLoaded") {
+        await this.client.loadCollection({ collection_name: this.collectionName });
+      }
+    }
   }
 }
 
@@ -427,8 +547,10 @@ const memoryPlugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = milvusMemoryConfigSchema.parse(api.pluginConfig);
-    const vectorDim = vectorDimsForModel(cfg.embedding.model ?? "text-embedding-3-small", cfg.embedding.dims);
-    const db = new MilvusMemoryDB(cfg.milvus, vectorDim);
+    const modelName = cfg.embedding.model ?? "text-embedding-3-small";
+    const vectorDim = vectorDimsForModel(modelName, cfg.embedding.dims);
+    const modelMeta = MilvusMemoryDB.buildModelMeta(modelName, vectorDim, cfg.embedding.baseUrl);
+    const db = new MilvusMemoryDB(cfg.milvus, vectorDim, modelMeta);
     const embeddings = new Embeddings(cfg.embedding.apiKey, cfg.embedding.model!, cfg.embedding.baseUrl);
 
     api.logger.info(
@@ -662,6 +784,182 @@ const memoryPlugin = {
           .action(async () => {
             const count = await db.count();
             console.log(`Total memories: ${count}`);
+          });
+
+        memory
+          .command("migrate")
+          .description("Migrate memories after embedding model change")
+          .action(async () => {
+            const clack = await import("@clack/prompts");
+
+            clack.intro("🔄 memory-milvus migration");
+
+            // Connect without model check
+            const spin = clack.spinner();
+            spin.start("Connecting to Milvus...");
+            try {
+              await db.connectForMigration();
+            } catch (err) {
+              spin.stop(`⚠ Connection failed: ${err instanceof Error ? err.message : String(err)}`);
+              return;
+            }
+
+            const stored = await db.getStoredModelMeta();
+            if (!stored) {
+              spin.stop("ℹ No model metadata found in collection (legacy collection or new install).");
+              const shouldStamp = await clack.confirm({
+                message: "Stamp current model metadata onto the collection? (non-destructive)",
+                initialValue: true,
+              });
+              if (clack.isCancel(shouldStamp) || !shouldStamp) {
+                clack.cancel("Migration cancelled.");
+                return;
+              }
+              // Drop and recreate to stamp metadata (preserves nothing for legacy)
+              await db.dropAndRecreate();
+              clack.outro("✅ Collection recreated with model metadata.");
+              return;
+            }
+
+            const currentMeta = db["modelMeta"];
+            if (stored.model === currentMeta.model && stored.baseUrl === currentMeta.baseUrl) {
+              spin.stop("✅ No model change detected. Nothing to migrate.");
+              return;
+            }
+
+            const count = await db.count();
+            spin.stop(
+              `Model change detected:\n` +
+              `  Old: ${stored.model}${stored.baseUrl ? ` (${stored.baseUrl})` : ""} — ${stored.dims} dims\n` +
+              `  New: ${currentMeta.model}${currentMeta.baseUrl ? ` (${currentMeta.baseUrl})` : ""} — ${currentMeta.dims} dims\n` +
+              `  Memories in collection: ${count}`,
+            );
+
+            if (count === 0) {
+              // No data — just recreate
+              const shouldRecreate = await clack.confirm({
+                message: "Collection is empty. Drop & recreate with new model?",
+                initialValue: true,
+              });
+              if (clack.isCancel(shouldRecreate) || !shouldRecreate) {
+                clack.cancel("Migration cancelled.");
+                return;
+              }
+              await db.dropAndRecreate();
+              clack.outro("✅ Collection recreated.");
+              return;
+            }
+
+            const action = await clack.select({
+              message: `How to handle ${count} existing memories?`,
+              options: [
+                {
+                  value: "reembed",
+                  label: "Re-embed all memories",
+                  hint: "preserves data, uses API calls",
+                },
+                {
+                  value: "drop",
+                  label: "Drop & start fresh",
+                  hint: `deletes all ${count} memories`,
+                },
+              ],
+            });
+            if (clack.isCancel(action)) { clack.cancel("Migration cancelled."); return; }
+
+            if (action === "drop") {
+              const confirmDrop = await clack.confirm({
+                message: `Are you sure? This will permanently delete ${count} memories.`,
+                initialValue: false,
+              });
+              if (clack.isCancel(confirmDrop) || !confirmDrop) {
+                clack.cancel("Migration cancelled.");
+                return;
+              }
+              const dropSpin = clack.spinner();
+              dropSpin.start("Dropping collection...");
+              await db.dropAndRecreate();
+              dropSpin.stop("✅ Collection recreated. Starting fresh.");
+              clack.outro("Migration complete.");
+              return;
+            }
+
+            // Re-embed flow
+            const reembedSpin = clack.spinner();
+            reembedSpin.start("Fetching all memory texts...");
+            const allTexts = await db.getAllTexts();
+            reembedSpin.stop(`Loaded ${allTexts.length} memories.`);
+
+            const embedSpin = clack.spinner();
+            embedSpin.start("Re-embedding memories with new model...");
+
+            try {
+              // Re-embed each text with new model
+              const newEntries: Array<{ id: string; text: string; vector: number[]; importance: number; category: string; created_at: number }> = [];
+              for (let i = 0; i < allTexts.length; i++) {
+                embedSpin.message(`Re-embedding ${i + 1}/${allTexts.length}...`);
+                const vector = await embeddings.embed(allTexts[i].text);
+                newEntries.push({ ...allTexts[i], vector });
+              }
+
+              // Rename old collection as backup, then create new
+              embedSpin.message("Checking for existing backup...");
+              const backupExists = await db["client"]!.hasCollection({
+                collection_name: `${db["collectionName"]}_backup`,
+              });
+              if (backupExists.value) {
+                embedSpin.stop("⚠ A previous backup collection exists.");
+                const overwrite = await clack.confirm({
+                  message: "Overwrite the previous backup?",
+                  initialValue: true,
+                });
+                if (clack.isCancel(overwrite) || !overwrite) {
+                  clack.cancel("Migration cancelled. No changes made.");
+                  return;
+                }
+                embedSpin.start("Backing up old collection...");
+              } else {
+                embedSpin.message("Backing up old collection...");
+              }
+              const backupName = await db.renameToBackup();
+
+              embedSpin.message("Creating new collection...");
+              db["initPromise"] = null;
+              db["client"] = null;
+              db["modelMismatch"] = null;
+              await db.connectForMigration();
+              // Collection doesn't exist now (renamed), so doInitialize will create it
+              db["initPromise"] = null;
+              await db["doInitialize"]();
+
+              // Insert all re-embedded entries
+              embedSpin.message("Inserting re-embedded memories...");
+              for (const entry of newEntries) {
+                await db.store({
+                  text: entry.text,
+                  vector: entry.vector,
+                  importance: entry.importance,
+                  category: entry.category as MemoryCategory,
+                });
+              }
+
+              embedSpin.stop(`✅ Re-embedded ${newEntries.length} memories.`);
+
+              // Ask about backup cleanup
+              const deleteBackup = await clack.confirm({
+                message: `Delete backup collection "${backupName}"?`,
+                initialValue: false,
+              });
+              if (!clack.isCancel(deleteBackup) && deleteBackup) {
+                await db.dropBackup();
+                clack.outro("Migration complete. Backup deleted.");
+              } else {
+                clack.outro(`Migration complete. Backup kept as "${backupName}".`);
+              }
+            } catch (err) {
+              embedSpin.stop(`⚠ Re-embedding failed: ${err instanceof Error ? err.message : String(err)}`);
+              clack.outro("Migration failed. Original collection is unchanged.");
+            }
           });
 
         memory
