@@ -663,6 +663,158 @@ const memoryPlugin = {
             const count = await db.count();
             console.log(`Total memories: ${count}`);
           });
+
+        memory
+          .command("setup")
+          .description("Interactive setup wizard for memory-milvus plugin")
+          .action(async () => {
+            const readline = await import("node:readline");
+            const fs = await import("node:fs");
+            const path = await import("node:path");
+            const os = await import("node:os");
+
+            const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+            const ask = (prompt: string, defaultValue?: string): Promise<string> =>
+              new Promise((resolve) => {
+                const suffix = defaultValue ? ` [${defaultValue}]` : "";
+                rl.question(`${prompt}${suffix}: `, (answer: string) => {
+                  resolve(answer.trim() || defaultValue || "");
+                });
+              });
+            const askSecret = (prompt: string): Promise<string> =>
+              new Promise((resolve) => {
+                process.stdout.write(`${prompt}: `);
+                const stdin = process.stdin;
+                const wasRaw = stdin.isRaw;
+                if (stdin.isTTY) stdin.setRawMode(true);
+                let secret = "";
+                const onData = (ch: Buffer) => {
+                  const c = ch.toString("utf8");
+                  if (c === "\n" || c === "\r") {
+                    stdin.removeListener("data", onData);
+                    if (stdin.isTTY) stdin.setRawMode(wasRaw ?? false);
+                    process.stdout.write("\n");
+                    resolve(secret);
+                  } else if (c === "\x7f" || c === "\b") {
+                    secret = secret.slice(0, -1);
+                  } else if (c === "\x03") {
+                    // Ctrl+C
+                    rl.close();
+                    process.exit(1);
+                  } else {
+                    secret += c;
+                  }
+                };
+                stdin.on("data", onData);
+              });
+            const askYesNo = async (prompt: string, defaultValue = false): Promise<boolean> => {
+              const suffix = defaultValue ? "[Y/n]" : "[y/N]";
+              const answer = await ask(`${prompt} ${suffix}`);
+              if (!answer) return defaultValue;
+              return answer.toLowerCase().startsWith("y");
+            };
+
+            console.log("\n🔧 memory-milvus setup wizard\n");
+
+            // --- Embedding config ---
+            console.log("── Embedding Provider ──");
+            const apiKey = await askSecret("API key (or env var like ${EMBEDDING_API_KEY})");
+
+            const baseUrl = await ask("Base URL (blank for OpenAI)", "");
+            const model = await ask("Model name", baseUrl ? "" : "text-embedding-3-small");
+            let dims: number | undefined;
+            if (baseUrl || (model && !["text-embedding-3-small", "text-embedding-3-large"].includes(model))) {
+              const dimsStr = await ask("Vector dimensions");
+              dims = dimsStr ? parseInt(dimsStr, 10) : undefined;
+              if (!dims || dims <= 0) {
+                console.log("  ⚠ dims is required for non-OpenAI models");
+                rl.close();
+                return;
+              }
+            }
+
+            // --- Milvus config ---
+            console.log("\n── Milvus Connection ──");
+            const address = await ask("Milvus address", "localhost:19530");
+            const authType = await ask("Auth type (none/password/token)", "none");
+
+            let username: string | undefined;
+            let password: string | undefined;
+            let token: string | undefined;
+
+            if (authType === "password") {
+              username = await ask("Username", "root");
+              password = await askSecret("Password (or env var like ${MILVUS_PASSWORD})");
+            } else if (authType === "token") {
+              token = await askSecret("Token (or env var like ${MILVUS_TOKEN})");
+            }
+
+            const collectionName = await ask("Collection name", "openclaw_memories");
+            const database = await ask("Database (blank for default)", "");
+
+            // --- Behavior ---
+            console.log("\n── Behavior ──");
+            const autoRecall = await askYesNo("Enable auto-recall?", true);
+            const autoCapture = await askYesNo("Enable auto-capture?", true);
+
+            rl.close();
+
+            // --- Build config ---
+            const embeddingConfig: Record<string, unknown> = { apiKey };
+            if (model) embeddingConfig.model = model;
+            if (baseUrl) embeddingConfig.baseUrl = baseUrl;
+            if (dims) embeddingConfig.dims = dims;
+
+            const milvusConfig: Record<string, unknown> = { address };
+            if (username) milvusConfig.username = username;
+            if (password) milvusConfig.password = password;
+            if (token) milvusConfig.token = token;
+            if (collectionName !== "openclaw_memories") milvusConfig.collectionName = collectionName;
+            if (database) milvusConfig.database = database;
+
+            const pluginCfg = {
+              embedding: embeddingConfig,
+              milvus: milvusConfig,
+              autoRecall,
+              autoCapture,
+            };
+
+            // --- Write to config file ---
+            const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+            let existingConfig: Record<string, unknown> = {};
+            try {
+              const content = fs.readFileSync(configPath, "utf8");
+              existingConfig = JSON.parse(content);
+            } catch {
+              // File doesn't exist yet
+            }
+
+            // Merge into existing config
+            const plugins = (existingConfig.plugins ?? {}) as Record<string, unknown>;
+            const entries = (plugins.entries ?? {}) as Record<string, unknown>;
+            const existing = (entries["memory-milvus"] ?? {}) as Record<string, unknown>;
+
+            entries["memory-milvus"] = { ...existing, enabled: true, config: pluginCfg };
+            plugins.entries = entries;
+
+            // Set memory slot
+            const slots = (plugins.slots ?? {}) as Record<string, unknown>;
+            slots.memory = "memory-milvus";
+            plugins.slots = slots;
+
+            existingConfig.plugins = plugins;
+
+            // Write
+            const configDir = path.dirname(configPath);
+            if (!fs.existsSync(configDir)) {
+              fs.mkdirSync(configDir, { recursive: true });
+            }
+            fs.writeFileSync(configPath, JSON.stringify(existingConfig, null, 2) + "\n");
+
+            console.log(`\n✅ Config written to ${configPath}`);
+            console.log("\nRestart the gateway to apply changes:");
+            console.log("  openclaw gateway restart\n");
+          });
       },
       { commands: ["milvus-mem"] },
     );
