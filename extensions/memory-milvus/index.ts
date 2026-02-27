@@ -557,6 +557,24 @@ const memoryPlugin = {
       `memory-milvus: plugin registered (address: ${cfg.milvus.address}, collection: ${cfg.milvus.collectionName}, lazy init)`,
     );
 
+    // Eager model mismatch check (non-blocking)
+    void (async () => {
+      try {
+        const checkDb = new MilvusMemoryDB(cfg.milvus, vectorDim, modelMeta);
+        await checkDb.connectForMigration();
+        const stored = await checkDb.getStoredModelMeta();
+        if (stored && (stored.model !== modelMeta.model || stored.baseUrl !== modelMeta.baseUrl)) {
+          api.logger.error(
+            `memory-milvus: ⚠ Embedding model changed! ` +
+            `"${stored.model}" → "${modelMeta.model}". ` +
+            `Memory tools will fail until you run: openclaw milvus-mem migrate`,
+          );
+        }
+      } catch {
+        // Silently ignore — will surface later on first tool use
+      }
+    })();
+
     // ========================================================================
     // Tools
     // ========================================================================
@@ -805,36 +823,23 @@ const memoryPlugin = {
             }
 
             const stored = await db.getStoredModelMeta();
-            if (!stored) {
-              spin.stop("ℹ No model metadata found in collection (legacy collection or new install).");
-              const shouldStamp = await clack.confirm({
-                message: "Stamp current model metadata onto the collection? (non-destructive)",
-                initialValue: true,
-              });
-              if (clack.isCancel(shouldStamp) || !shouldStamp) {
-                clack.cancel("Migration cancelled.");
-                return;
-              }
-              // Drop and recreate to stamp metadata (preserves nothing for legacy)
-              await db.dropAndRecreate();
-              clack.outro("✅ Collection recreated with model metadata.");
-              return;
-            }
-
             const currentMeta = db["modelMeta"];
-            if (stored.model === currentMeta.model && stored.baseUrl === currentMeta.baseUrl) {
+
+            if (stored && stored.model === currentMeta.model && stored.baseUrl === currentMeta.baseUrl) {
               spin.stop("✅ No model change detected. Nothing to migrate.");
               return;
             }
 
             const count = await db.count();
+            const oldLabel = stored
+              ? `${stored.model}${stored.baseUrl ? ` (${stored.baseUrl})` : ""} — ${stored.dims} dims`
+              : "unknown (no metadata)";
             spin.stop(
               `Model change detected:\n` +
-              `  Old: ${stored.model}${stored.baseUrl ? ` (${stored.baseUrl})` : ""} — ${stored.dims} dims\n` +
+              `  Old: ${oldLabel}\n` +
               `  New: ${currentMeta.model}${currentMeta.baseUrl ? ` (${currentMeta.baseUrl})` : ""} — ${currentMeta.dims} dims\n` +
               `  Memories in collection: ${count}`,
             );
-
             if (count === 0) {
               // No data — just recreate
               const shouldRecreate = await clack.confirm({
