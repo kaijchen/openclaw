@@ -676,18 +676,58 @@ const memoryPlugin = {
             clack.intro("🔧 memory-milvus setup");
 
             // --- Embedding Provider ---
+            // Known providers with OpenAI-compatible /v1/embeddings API
+            type ModelOption = { value: string; label: string; hint: string; dims?: number };
+            const PROVIDERS: Record<string, { baseUrl?: string; models: ModelOption[]; allowCustomModel?: boolean }> = {
+              openai: {
+                models: [
+                  { value: "text-embedding-3-small", label: "text-embedding-3-small", hint: "1536 dims, fast", dims: 1536 },
+                  { value: "text-embedding-3-large", label: "text-embedding-3-large", hint: "3072 dims, accurate", dims: 3072 },
+                ],
+              },
+              voyage: {
+                baseUrl: "https://api.voyageai.com/v1",
+                models: [
+                  { value: "voyage-4-large", label: "voyage-4-large", hint: "16384 dims, best quality", dims: 16384 },
+                  { value: "voyage-3", label: "voyage-3", hint: "1024 dims, balanced", dims: 1024 },
+                  { value: "voyage-3-lite", label: "voyage-3-lite", hint: "512 dims, fastest", dims: 512 },
+                  { value: "voyage-code-3", label: "voyage-code-3", hint: "1024 dims, code-optimized", dims: 1024 },
+                ],
+              },
+              mistral: {
+                baseUrl: "https://api.mistral.ai/v1",
+                models: [
+                  { value: "mistral-embed", label: "mistral-embed", hint: "1024 dims", dims: 1024 },
+                ],
+              },
+              volcengine: {
+                baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+                allowCustomModel: true,
+                models: [
+                  { value: "doubao-embedding-large-text-250515", label: "doubao-embedding-large-text-250515", hint: "2048 dims, latest", dims: 2048 },
+                  { value: "doubao-embedding-large-text-240915", label: "doubao-embedding-large-text-240915", hint: "4096 dims", dims: 4096 },
+                  { value: "doubao-embedding-text-240715", label: "doubao-embedding-text-240715", hint: "2560 dims", dims: 2560 },
+                  { value: "doubao-embedding-text-240515", label: "doubao-embedding-text-240515", hint: "2048 dims", dims: 2048 },
+                  { value: "__custom__", label: "Custom endpoint", hint: "e.g. ep-m-xxx" },
+                ],
+              },
+            };
+
             const embeddingProvider = await clack.select({
               message: "Embedding provider",
               options: [
                 { value: "openai", label: "OpenAI", hint: "text-embedding-3-small / 3-large" },
-                { value: "custom", label: "Custom (OpenAI-compatible)", hint: "Doubao, Azure, etc." },
+                { value: "voyage", label: "Voyage AI", hint: "voyage-4-large / voyage-3" },
+                { value: "mistral", label: "Mistral", hint: "mistral-embed" },
+                { value: "volcengine", label: "Volcano Engine", hint: "Doubao embedding models" },
+                { value: "custom", label: "Custom (OpenAI-compatible)", hint: "Azure, etc." },
               ],
             });
             if (clack.isCancel(embeddingProvider)) { clack.cancel("Setup cancelled."); return; }
 
             const apiKey = await clack.password({
               message: "Embedding API key",
-              validate: (v) => (!v?.trim() ? "API key is required" : undefined),
+              validate: (v: string) => (!v?.trim() ? "API key is required" : undefined),
             });
             if (clack.isCancel(apiKey)) { clack.cancel("Setup cancelled."); return; }
 
@@ -695,19 +735,56 @@ const memoryPlugin = {
             let model = "";
             let dims: number | undefined;
 
-            if (embeddingProvider === "custom") {
+            const providerInfo = PROVIDERS[embeddingProvider];
+            if (providerInfo) {
+              // Known provider — select from predefined models
+              if (providerInfo.baseUrl) baseUrl = providerInfo.baseUrl;
+
+              const modelChoice = await clack.select({
+                message: "Embedding model",
+                options: providerInfo.models,
+              });
+              if (clack.isCancel(modelChoice)) { clack.cancel("Setup cancelled."); return; }
+
+              if (modelChoice === "__custom__") {
+                // Custom endpoint (e.g. Volcengine endpoint ID)
+                const endpointInput = await clack.text({
+                  message: "Endpoint ID or model name",
+                  placeholder: "ep-m-20250630180859-zzj6m",
+                  validate: (v: string) => (!v?.trim() ? "Endpoint is required" : undefined),
+                });
+                if (clack.isCancel(endpointInput)) { clack.cancel("Setup cancelled."); return; }
+                model = endpointInput;
+
+                const dimsInput = await clack.text({
+                  message: "Vector dimensions",
+                  placeholder: "2048",
+                  validate: (v: string) => {
+                    const n = parseInt(v, 10);
+                    if (!n || n <= 0) return "Must be a positive number";
+                    return undefined;
+                  },
+                });
+                if (clack.isCancel(dimsInput)) { clack.cancel("Setup cancelled."); return; }
+                dims = parseInt(dimsInput, 10);
+              } else {
+                model = modelChoice;
+                dims = providerInfo.models.find((m) => m.value === modelChoice)?.dims;
+              }
+            } else {
+              // Custom provider — manual input
               const baseUrlInput = await clack.text({
                 message: "Embedding base URL",
                 placeholder: "https://ark.cn-beijing.volces.com/api/v3",
-                validate: (v) => (!v?.trim() ? "Base URL is required for custom provider" : undefined),
+                validate: (v: string) => (!v?.trim() ? "Base URL is required for custom provider" : undefined),
               });
               if (clack.isCancel(baseUrlInput)) { clack.cancel("Setup cancelled."); return; }
               baseUrl = baseUrlInput;
 
               const modelInput = await clack.text({
-                message: "Model name",
+                message: "Model name or endpoint ID",
                 placeholder: "ep-m-20250630180859-zzj6m",
-                validate: (v) => (!v?.trim() ? "Model name is required" : undefined),
+                validate: (v: string) => (!v?.trim() ? "Model name is required" : undefined),
               });
               if (clack.isCancel(modelInput)) { clack.cancel("Setup cancelled."); return; }
               model = modelInput;
@@ -715,7 +792,7 @@ const memoryPlugin = {
               const dimsInput = await clack.text({
                 message: "Vector dimensions",
                 placeholder: "2048",
-                validate: (v) => {
+                validate: (v: string) => {
                   const n = parseInt(v, 10);
                   if (!n || n <= 0) return "Must be a positive number";
                   return undefined;
@@ -723,23 +800,59 @@ const memoryPlugin = {
               });
               if (clack.isCancel(dimsInput)) { clack.cancel("Setup cancelled."); return; }
               dims = parseInt(dimsInput, 10);
-            } else {
-              const modelChoice = await clack.select({
-                message: "Embedding model",
-                options: [
-                  { value: "text-embedding-3-small", label: "text-embedding-3-small", hint: "1536 dims, fast, cheap" },
-                  { value: "text-embedding-3-large", label: "text-embedding-3-large", hint: "3072 dims, more accurate" },
-                ],
-              });
-              if (clack.isCancel(modelChoice)) { clack.cancel("Setup cancelled."); return; }
-              model = modelChoice;
+            }
+
+            // --- Test embedding ---
+            let embeddingVerified = false;
+            while (!embeddingVerified) {
+              const spin = clack.spinner();
+              spin.start("Testing embedding service...");
+              try {
+                const { default: OpenAI } = await import("openai");
+                const client = new OpenAI({
+                  apiKey,
+                  ...(baseUrl ? { baseURL: baseUrl } : {}),
+                });
+                const response = await client.embeddings.create({
+                  model,
+                  input: "openclaw",
+                });
+                const vector = response.data?.[0]?.embedding;
+                if (!vector || vector.length === 0) {
+                  throw new Error("Empty embedding vector returned");
+                }
+                if (dims && vector.length !== dims) {
+                  spin.stop(`⚠ Dimension mismatch: expected ${dims}, got ${vector.length}`);
+                  const fixDims = await clack.confirm({
+                    message: `Update dims to ${vector.length}?`,
+                    initialValue: true,
+                  });
+                  if (clack.isCancel(fixDims)) { clack.cancel("Setup cancelled."); return; }
+                  if (fixDims) {
+                    dims = vector.length;
+                  }
+                } else if (!dims) {
+                  dims = vector.length;
+                }
+                spin.stop(`✅ Embedding OK (${vector.length} dims)`);
+                embeddingVerified = true;
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                spin.stop(`⚠ Embedding failed: ${errMsg}`);
+                const retry = await clack.confirm({
+                  message: "Retry? (select No to save config without verification)",
+                  initialValue: true,
+                });
+                if (clack.isCancel(retry)) { clack.cancel("Setup cancelled."); return; }
+                if (!retry) break;
+              }
             }
 
             // --- Milvus Connection ---
             const address = await clack.text({
               message: "Milvus address",
               placeholder: "host:port or https://host:port",
-              validate: (v) => (!v?.trim() ? "Address is required" : undefined),
+              validate: (v: string) => (!v?.trim() ? "Address is required" : undefined),
             });
             if (clack.isCancel(address)) { clack.cancel("Setup cancelled."); return; }
 
@@ -767,17 +880,45 @@ const memoryPlugin = {
 
               const passwordInput = await clack.password({
                 message: "Milvus password",
-                validate: (v) => (!v?.trim() ? "Password is required" : undefined),
+                validate: (v: string) => (!v?.trim() ? "Password is required" : undefined),
               });
               if (clack.isCancel(passwordInput)) { clack.cancel("Setup cancelled."); return; }
               password = passwordInput;
             } else if (authType === "token") {
               const tokenInput = await clack.password({
                 message: "Milvus token",
-                validate: (v) => (!v?.trim() ? "Token is required" : undefined),
+                validate: (v: string) => (!v?.trim() ? "Token is required" : undefined),
               });
               if (clack.isCancel(tokenInput)) { clack.cancel("Setup cancelled."); return; }
               token = tokenInput;
+            }
+
+            // --- Test Milvus connection ---
+            let milvusVerified = false;
+            while (!milvusVerified) {
+              const spin = clack.spinner();
+              spin.start("Testing Milvus connection...");
+              try {
+                const { MilvusClient } = await loadMilvus();
+                const testClient = new MilvusClient({
+                  address,
+                  ...(token ? { token } : {}),
+                  ...(username ? { username } : {}),
+                  ...(password ? { password } : {}),
+                });
+                await testClient.checkHealth();
+                spin.stop("✅ Milvus connection successful");
+                milvusVerified = true;
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                spin.stop(`⚠ Milvus connection failed: ${errMsg}`);
+                const retry = await clack.confirm({
+                  message: "Retry? (select No to save config without verification)",
+                  initialValue: true,
+                });
+                if (clack.isCancel(retry)) { clack.cancel("Setup cancelled."); return; }
+                if (!retry) break;
+              }
             }
 
             // --- Behavior ---
@@ -792,31 +933,6 @@ const memoryPlugin = {
               initialValue: true,
             });
             if (clack.isCancel(autoCapture)) { clack.cancel("Setup cancelled."); return; }
-
-            // --- Test connection ---
-            const spin = clack.spinner();
-            spin.start("Testing Milvus connection...");
-            try {
-              const { MilvusClient } = await loadMilvus();
-              const testClient = new MilvusClient({
-                address,
-                ...(token ? { token } : {}),
-                ...(username ? { username } : {}),
-                ...(password ? { password } : {}),
-              });
-              await testClient.checkHealth();
-              spin.stop("✅ Milvus connection successful");
-            } catch (err) {
-              spin.stop(`⚠ Milvus connection failed: ${String(err)}`);
-              const proceed = await clack.confirm({
-                message: "Save config anyway?",
-                initialValue: false,
-              });
-              if (clack.isCancel(proceed) || !proceed) {
-                clack.cancel("Setup cancelled.");
-                return;
-              }
-            }
 
             // --- Build config ---
             const embeddingConfig: Record<string, unknown> = { apiKey };
